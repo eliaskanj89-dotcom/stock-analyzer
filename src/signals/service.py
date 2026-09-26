@@ -7,16 +7,19 @@ import pandas as pd
 
 from src.market_data import MarketDataProvider
 from src.signals.models import (
+    MarketRegime,
     PositionPlan,
+    PriceFreshness,
     ScoreBreakdown,
     SignalAction,
     TechnicalSnapshot,
+    TimeframeAnalysis,
     TradeSignal,
 )
 
 
 class SignalService:
-    """Deterministic V1 signal generator. AI explanations can be layered on later."""
+    """Deterministic signal engine. LLMs may explain results but never create price levels."""
 
     def __init__(self, provider: MarketDataProvider):
         self.provider = provider
@@ -28,85 +31,98 @@ class SignalService:
         portfolio_value: float | None = None,
         max_risk_pct: float = 1.0,
     ) -> TradeSignal:
-        frame = self.provider.history(symbol, period="1y", interval="1d")
+        symbol = symbol.strip().upper()
+        if not symbol or len(symbol) > 20:
+            raise ValueError("Invalid symbol")
+
+        daily = self.provider.history(symbol, period="1y", interval="1d")
         quote = self.provider.quote(symbol)
-        indicators = self._indicators(frame)
-        score = self._score(frame, indicators)
+        indicators = self._indicators(daily)
+        regime = self._regime(indicators)
+        timeframes = self._multi_timeframe(symbol, daily)
+        scores = self._score(daily, indicators, regime, timeframes)
+        action = self._action(scores.total, indicators, regime)
+        levels = self._levels(action, quote.price, indicators)
 
-        action = self._action(score.total)
-        atr = indicators["atr_14"]
-        support = indicators["support"]
-        resistance = indicators["resistance"]
-        price = quote.price
-
-        if action in {SignalAction.strong_long, SignalAction.long, SignalAction.watch}:
-            ideal_entry = min(price, indicators["ema_20"] or price)
-            entry_low = max(0.01, ideal_entry - 0.35 * atr)
-            entry_high = ideal_entry + 0.35 * atr
-            stop = min(support, ideal_entry - 1.5 * atr) if support else ideal_entry - 1.5 * atr
-            risk = max(ideal_entry - stop, 0.01)
-            tp1 = max(resistance, ideal_entry + 1.0 * risk) if resistance else ideal_entry + risk
-            tp2 = ideal_entry + 2.0 * risk
-            tp3 = ideal_entry + 3.0 * risk
-            rr = (tp2 - ideal_entry) / risk
-            invalidation = f"Daily close below {stop:.2f} invalidates the bullish setup."
-        elif action in {SignalAction.strong_short, SignalAction.short}:
-            ideal_entry = max(price, indicators["ema_20"] or price)
-            entry_low = max(0.01, ideal_entry - 0.35 * atr)
-            entry_high = ideal_entry + 0.35 * atr
-            stop = max(resistance, ideal_entry + 1.5 * atr) if resistance else ideal_entry + 1.5 * atr
-            risk = max(stop - ideal_entry, 0.01)
-            tp1 = min(support, ideal_entry - 1.0 * risk) if support else ideal_entry - risk
-            tp2 = max(0.01, ideal_entry - 2.0 * risk)
-            tp3 = max(0.01, ideal_entry - 3.0 * risk)
-            rr = (ideal_entry - tp2) / risk
-            invalidation = f"Daily close above {stop:.2f} invalidates the bearish setup."
-        else:
-            ideal_entry = entry_low = entry_high = stop = tp1 = tp2 = tp3 = rr = None
-            invalidation = "No active trade setup. Wait for stronger confluence."
-
-        position_plan = None
-        if portfolio_value and ideal_entry and stop:
-            risk_per_unit = abs(ideal_entry - stop)
-            max_risk_amount = portfolio_value * (max_risk_pct / 100.0)
-            units = int(max_risk_amount // risk_per_unit) if risk_per_unit > 0 else 0
-            position_plan = PositionPlan(
-                portfolio_value=portfolio_value,
-                max_risk_pct=max_risk_pct,
-                max_risk_amount=round(max_risk_amount, 2),
-                risk_per_unit=round(risk_per_unit, 4),
-                suggested_units=units,
-                estimated_position_value=round(units * ideal_entry, 2),
-            )
-
-        thesis = self._thesis(frame, indicators, action)
-        risks = self._risks(indicators, action)
+        position_plan = self._position_plan(
+            portfolio_value=portfolio_value,
+            max_risk_pct=max_risk_pct,
+            entry=levels["ideal_entry"],
+            stop=levels["stop_loss"],
+        )
 
         return TradeSignal(
-            symbol=symbol.upper(),
+            symbol=symbol,
             action=action,
             generated_at=datetime.now(timezone.utc),
+            price_timestamp=quote.timestamp,
+            price_freshness=PriceFreshness.unknown,
             timeframe=timeframe,
-            current_price=round(price, 4),
-            entry_zone_low=self._r(entry_low),
-            entry_zone_high=self._r(entry_high),
-            ideal_entry=self._r(ideal_entry),
-            stop_loss=self._r(stop),
-            take_profit_1=self._r(tp1),
-            take_profit_2=self._r(tp2),
-            take_profit_3=self._r(tp3),
-            risk_reward=self._r(rr),
-            signal_strength=score.total,
-            scores=score,
+            market_regime=regime,
+            current_price=round(quote.price, 4),
+            entry_zone_low=self._r(levels["entry_zone_low"]),
+            entry_zone_high=self._r(levels["entry_zone_high"]),
+            ideal_entry=self._r(levels["ideal_entry"]),
+            stop_loss=self._r(levels["stop_loss"]),
+            take_profit_1=self._r(levels["take_profit_1"]),
+            take_profit_2=self._r(levels["take_profit_2"]),
+            take_profit_3=self._r(levels["take_profit_3"]),
+            risk_reward=self._r(levels["risk_reward"]),
+            signal_strength=scores.total,
+            scores=scores,
             technicals=TechnicalSnapshot(**{k: self._r(v) for k, v in indicators.items()}),
-            thesis=thesis,
-            risks=risks,
-            invalidation=invalidation,
+            timeframes=timeframes,
+            thesis=self._thesis(indicators, action, regime, timeframes),
+            catalysts=self._catalysts(indicators, action),
+            risks=self._risks(indicators, action, regime),
+            invalidation=levels["invalidation"],
             position_plan=position_plan,
             data_source=self.provider.name,
         )
 
+    def _multi_timeframe(self, symbol: str, daily: pd.DataFrame) -> list[TimeframeAnalysis]:
+        specs = [
+            ("Short term", "1h", "3mo", "1h"),
+            ("Swing", "1d", None, None),
+            ("Primary trend", "1wk", "2y", "1wk"),
+        ]
+        output: list[TimeframeAnalysis] = []
+        for label, interval, period, provider_interval in specs:
+            try:
+                frame = daily if interval == "1d" else self.provider.history(symbol, period=period, interval=provider_interval)
+                i = self._indicators(frame)
+                price = float(frame["close"].iloc[-1])
+                bullish = int(bool(i["ema_20"] and price > i["ema_20"])) + int(
+                    bool(i["ema_20"] and i["ema_50"] and i["ema_20"] > i["ema_50"])
+                )
+                rsi = i["rsi_14"]
+                if bullish == 2 and rsi is not None and rsi >= 50:
+                    trend, score = "BULLISH", 85.0
+                elif bullish >= 1:
+                    trend, score = "MIXED_BULLISH", 65.0
+                elif bullish == 0 and rsi is not None and rsi < 45:
+                    trend, score = "BEARISH", 25.0
+                else:
+                    trend, score = "MIXED", 45.0
+                output.append(
+                    TimeframeAnalysis(
+                        label=label,
+                        interval=interval,
+                        trend=trend,
+                        score=score,
+                        last_close=self._r(price),
+                        ema_20=self._r(i["ema_20"]),
+                        ema_50=self._r(i["ema_50"]),
+                        rsi_14=self._r(rsi),
+                    )
+                )
+            except Exception:
+                continue
+        return output
+
     def _indicators(self, frame: pd.DataFrame) -> dict[str, float | None]:
+        if len(frame) < 30:
+            raise ValueError("Insufficient price history for signal generation")
         close = frame["close"].astype(float)
         high = frame["high"].astype(float)
         low = frame["low"].astype(float)
@@ -115,87 +131,107 @@ class SignalService:
         ema20 = close.ewm(span=20, adjust=False).mean()
         ema50 = close.ewm(span=50, adjust=False).mean()
         ema200 = close.ewm(span=200, adjust=False).mean()
-
         delta = close.diff()
-        gain = delta.clip(lower=0).rolling(14).mean()
-        loss = (-delta.clip(upper=0)).rolling(14).mean().replace(0, np.nan)
-        rs = gain / loss
-        rsi = 100 - (100 / (1 + rs))
-
-        macd_series = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
-        macd_signal_series = macd_series.ewm(span=9, adjust=False).mean()
+        gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+        loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean().replace(0, np.nan)
+        rsi = 100 - (100 / (1 + gain / loss))
+        macd = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
+        macd_signal = macd.ewm(span=9, adjust=False).mean()
 
         prev_close = close.shift(1)
-        true_range = pd.concat(
-            [(high - low), (high - prev_close).abs(), (low - prev_close).abs()],
-            axis=1,
-        ).max(axis=1)
-        atr = true_range.rolling(14).mean()
-
+        tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+        atr = tr.ewm(alpha=1 / 14, adjust=False).mean()
         avg_vol = volume.rolling(20).mean()
-        rel_vol = volume.iloc[-1] / avg_vol.iloc[-1] if avg_vol.iloc[-1] else np.nan
-
+        relative_volume = volume.iloc[-1] / avg_vol.iloc[-1] if avg_vol.iloc[-1] else np.nan
         lookback = frame.tail(20)
+        change_20d = (close.iloc[-1] / close.iloc[-21] - 1) * 100 if len(close) >= 21 else np.nan
+        distance_200 = (close.iloc[-1] / ema200.iloc[-1] - 1) * 100 if ema200.iloc[-1] else np.nan
+
         return {
             "rsi_14": self._finite(rsi.iloc[-1]),
-            "macd": self._finite(macd_series.iloc[-1]),
-            "macd_signal": self._finite(macd_signal_series.iloc[-1]),
+            "macd": self._finite(macd.iloc[-1]),
+            "macd_signal": self._finite(macd_signal.iloc[-1]),
             "ema_20": self._finite(ema20.iloc[-1]),
             "ema_50": self._finite(ema50.iloc[-1]),
             "ema_200": self._finite(ema200.iloc[-1]),
             "atr_14": self._finite(atr.iloc[-1]) or max(float(close.iloc[-1]) * 0.02, 0.01),
-            "relative_volume": self._finite(rel_vol),
+            "relative_volume": self._finite(relative_volume),
             "support": self._finite(float(lookback["low"].min())),
             "resistance": self._finite(float(lookback["high"].max())),
+            "change_20d_pct": self._finite(change_20d),
+            "distance_from_200ema_pct": self._finite(distance_200),
         }
 
-    def _score(self, frame: pd.DataFrame, i: dict[str, float | None]) -> ScoreBreakdown:
+    @staticmethod
+    def _regime(i: dict[str, float | None]) -> MarketRegime:
+        e20, e50, e200 = i["ema_20"], i["ema_50"], i["ema_200"]
+        if e20 and e50 and e200:
+            if e20 > e50 > e200:
+                return MarketRegime.strong_uptrend
+            if e20 > e50:
+                return MarketRegime.uptrend
+            if e20 < e50 < e200:
+                return MarketRegime.strong_downtrend
+            if e20 < e50:
+                return MarketRegime.downtrend
+        return MarketRegime.range
+
+    def _score(
+        self,
+        frame: pd.DataFrame,
+        i: dict[str, float | None],
+        regime: MarketRegime,
+        timeframes: list[TimeframeAnalysis],
+    ) -> ScoreBreakdown:
         price = float(frame["close"].iloc[-1])
         trend = 0.0
-        if i["ema_20"] and price > i["ema_20"]:
-            trend += 8
-        if i["ema_20"] and i["ema_50"] and i["ema_20"] > i["ema_50"]:
-            trend += 8
-        if i["ema_50"] and i["ema_200"] and i["ema_50"] > i["ema_200"]:
-            trend += 9
+        trend += 8 if i["ema_20"] and price > i["ema_20"] else 0
+        trend += 8 if i["ema_20"] and i["ema_50"] and i["ema_20"] > i["ema_50"] else 0
+        trend += 9 if i["ema_50"] and i["ema_200"] and i["ema_50"] > i["ema_200"] else 0
 
         momentum = 0.0
         rsi = i["rsi_14"]
         if rsi is not None:
-            if 50 <= rsi <= 70:
-                momentum += 12
-            elif 40 <= rsi < 50:
-                momentum += 7
-            elif 30 <= rsi < 40:
-                momentum += 3
+            momentum += 12 if 50 <= rsi <= 68 else 7 if 45 <= rsi < 50 else 3 if 35 <= rsi < 45 else 0
         if i["macd"] is not None and i["macd_signal"] is not None and i["macd"] > i["macd_signal"]:
             momentum += 8
 
-        volume = 0.0
         rv = i["relative_volume"]
-        if rv is not None:
-            volume = min(15.0, max(0.0, 7.5 * rv))
+        volume = min(15.0, max(0.0, 7.5 * rv)) if rv is not None else 5.0
 
-        support = i["support"] or price
-        resistance = i["resistance"] or price
+        support, resistance = i["support"] or price, i["resistance"] or price
         span = max(resistance - support, 0.01)
-        location = (price - support) / span
-        structure = max(0.0, min(15.0, 15.0 * (1.0 - min(location, 1.0))))
+        location = max(0.0, min(1.0, (price - support) / span))
+        structure = round(7.5 + (7.5 * (1 - abs(0.5 - location) * 2)), 2)
 
-        regime = 10.0 if i["ema_50"] and i["ema_200"] and i["ema_50"] > i["ema_200"] else 5.0
-        risk_reward = 7.0
+        regime_score = {
+            MarketRegime.strong_uptrend: 15.0,
+            MarketRegime.uptrend: 12.0,
+            MarketRegime.range: 7.0,
+            MarketRegime.downtrend: 4.0,
+            MarketRegime.strong_downtrend: 1.0,
+        }[regime]
+        if timeframes:
+            bullish_share = sum(t.score >= 60 for t in timeframes) / len(timeframes)
+            regime_score = min(15.0, regime_score * 0.7 + bullish_share * 4.5)
 
         return ScoreBreakdown(
             trend=round(trend, 2),
             momentum=round(momentum, 2),
             volume=round(volume, 2),
-            structure=round(structure, 2),
-            regime=round(regime, 2),
-            risk_reward=round(risk_reward, 2),
+            structure=structure,
+            regime=round(regime_score, 2),
+            risk_reward=8.0,
         )
 
     @staticmethod
-    def _action(score: float) -> SignalAction:
+    def _action(score: float, i: dict[str, float | None], regime: MarketRegime) -> SignalAction:
+        bearish_regime = regime in {MarketRegime.downtrend, MarketRegime.strong_downtrend}
+        macd_bearish = (
+            i["macd"] is not None and i["macd_signal"] is not None and i["macd"] < i["macd_signal"]
+        )
+        if bearish_regime and macd_bearish and score < 45:
+            return SignalAction.strong_short if regime == MarketRegime.strong_downtrend else SignalAction.short
         if score >= 82:
             return SignalAction.strong_long
         if score >= 70:
@@ -204,48 +240,100 @@ class SignalService:
             return SignalAction.watch
         if score >= 45:
             return SignalAction.neutral
-        if score >= 32:
-            return SignalAction.short
-        if score < 32:
-            return SignalAction.strong_short
         return SignalAction.no_trade
 
+    def _levels(self, action: SignalAction, price: float, i: dict[str, float | None]) -> dict[str, float | str | None]:
+        atr = float(i["atr_14"] or price * 0.02)
+        support, resistance = i["support"], i["resistance"]
+        if action in {SignalAction.strong_long, SignalAction.long}:
+            anchor = min(price, float(i["ema_20"] or price))
+            low, high = max(0.01, anchor - 0.25 * atr), anchor + 0.25 * atr
+            stop = min(float(support), anchor - 1.5 * atr) if support else anchor - 1.5 * atr
+            risk = max(anchor - stop, 0.01)
+            tp1 = max(float(resistance), anchor + risk) if resistance else anchor + risk
+            tp2, tp3 = anchor + 2 * risk, anchor + 3 * risk
+            return self._level_dict(low, high, anchor, stop, tp1, tp2, tp3, 2.0, f"Daily close below {stop:.2f}.")
+        if action in {SignalAction.strong_short, SignalAction.short}:
+            anchor = max(price, float(i["ema_20"] or price))
+            low, high = max(0.01, anchor - 0.25 * atr), anchor + 0.25 * atr
+            stop = max(float(resistance), anchor + 1.5 * atr) if resistance else anchor + 1.5 * atr
+            risk = max(stop - anchor, 0.01)
+            tp1 = min(float(support), anchor - risk) if support else anchor - risk
+            tp2, tp3 = max(0.01, anchor - 2 * risk), max(0.01, anchor - 3 * risk)
+            return self._level_dict(low, high, anchor, stop, tp1, tp2, tp3, 2.0, f"Daily close above {stop:.2f}.")
+        return self._level_dict(None, None, None, None, None, None, None, None, "No executable setup yet.")
+
     @staticmethod
-    def _thesis(frame: pd.DataFrame, i: dict[str, float | None], action: SignalAction) -> list[str]:
-        price = float(frame["close"].iloc[-1])
-        points: list[str] = []
-        if i["ema_20"] and i["ema_50"]:
-            points.append(
-                "Short-term trend is bullish."
-                if i["ema_20"] > i["ema_50"]
-                else "Short-term trend is not yet bullish."
-            )
+    def _level_dict(low, high, entry, stop, tp1, tp2, tp3, rr, invalidation):
+        return {
+            "entry_zone_low": low, "entry_zone_high": high, "ideal_entry": entry, "stop_loss": stop,
+            "take_profit_1": tp1, "take_profit_2": tp2, "take_profit_3": tp3,
+            "risk_reward": rr, "invalidation": invalidation,
+        }
+
+    @staticmethod
+    def _position_plan(portfolio_value, max_risk_pct, entry, stop):
+        if not portfolio_value or not entry or not stop:
+            return None
+        risk_per_unit = abs(float(entry) - float(stop))
+        max_risk_amount = portfolio_value * max_risk_pct / 100
+        units_by_risk = int(max_risk_amount // risk_per_unit) if risk_per_unit else 0
+        units_by_cash = int(portfolio_value // float(entry))
+        units = max(0, min(units_by_risk, units_by_cash))
+        value = units * float(entry)
+        return PositionPlan(
+            portfolio_value=portfolio_value,
+            max_risk_pct=max_risk_pct,
+            max_risk_amount=round(max_risk_amount, 2),
+            risk_per_unit=round(risk_per_unit, 4),
+            suggested_units=units,
+            estimated_position_value=round(value, 2),
+            portfolio_allocation_pct=round(value / portfolio_value * 100, 2),
+        )
+
+    @staticmethod
+    def _thesis(i, action, regime, timeframes):
+        points = [f"Market regime: {regime.value}.", f"Engine classification: {action.value}."]
         if i["rsi_14"] is not None:
-            points.append(f"RSI(14) is {i['rsi_14']:.1f}.")
+            points.append(f"RSI(14): {i['rsi_14']:.1f}.")
         if i["relative_volume"] is not None:
-            points.append(f"Relative volume is {i['relative_volume']:.2f}x its 20-day average.")
-        points.append(f"Last daily close used for technical structure was {price:.2f}.")
-        points.append(f"Engine classification: {action.value}.")
+            points.append(f"Relative volume: {i['relative_volume']:.2f}x the 20-period average.")
+        if timeframes:
+            aligned = sum(t.score >= 60 for t in timeframes)
+            points.append(f"Multi-timeframe alignment: {aligned}/{len(timeframes)} bullish or mixed-bullish.")
         return points
 
     @staticmethod
-    def _risks(i: dict[str, float | None], action: SignalAction) -> list[str]:
-        risks = ["Signals are model-generated and can fail; stop levels must be respected."]
+    def _catalysts(i, action):
+        items = []
+        if i["relative_volume"] is not None and i["relative_volume"] >= 1.25:
+            items.append("Above-average volume confirms elevated participation.")
+        if i["macd"] is not None and i["macd_signal"] is not None and i["macd"] > i["macd_signal"]:
+            items.append("MACD is above its signal line.")
+        if action in {SignalAction.strong_long, SignalAction.long}:
+            items.append("Upside continuation improves if price holds the entry zone and clears resistance.")
+        return items
+
+    @staticmethod
+    def _risks(i, action, regime):
+        risks = ["Model levels can fail; gap risk can cause fills beyond the modeled stop."]
         if i["relative_volume"] is not None and i["relative_volume"] < 0.8:
             risks.append("Volume confirmation is weak.")
         if i["rsi_14"] is not None and i["rsi_14"] > 70:
-            risks.append("RSI indicates an extended/overbought condition.")
+            risks.append("RSI is extended, increasing pullback risk.")
+        if regime == MarketRegime.range:
+            risks.append("Range regime increases false-breakout risk.")
         if action in {SignalAction.neutral, SignalAction.watch, SignalAction.no_trade}:
-            risks.append("Confluence is not strong enough for a high-conviction entry.")
+            risks.append("There is no high-conviction executable setup yet.")
         return risks
 
     @staticmethod
-    def _finite(value: float | np.floating | None) -> float | None:
+    def _finite(value):
         if value is None:
             return None
         value = float(value)
         return value if np.isfinite(value) else None
 
     @staticmethod
-    def _r(value: float | None) -> float | None:
+    def _r(value):
         return round(float(value), 4) if value is not None else None
