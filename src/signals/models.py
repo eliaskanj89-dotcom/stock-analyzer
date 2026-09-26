@@ -27,6 +27,20 @@ class SignalLifecycle(str, Enum):
     closed = "CLOSED"
 
 
+class MarketRegime(str, Enum):
+    strong_uptrend = "STRONG_UPTREND"
+    uptrend = "UPTREND"
+    range = "RANGE"
+    downtrend = "DOWNTREND"
+    strong_downtrend = "STRONG_DOWNTREND"
+
+
+class PriceFreshness(str, Enum):
+    realtime = "REALTIME"
+    delayed = "DELAYED"
+    unknown = "UNKNOWN"
+
+
 class ScoreBreakdown(BaseModel):
     trend: float = Field(ge=0, le=25)
     momentum: float = Field(ge=0, le=20)
@@ -51,6 +65,19 @@ class TechnicalSnapshot(BaseModel):
     relative_volume: float | None = None
     support: float | None = None
     resistance: float | None = None
+    change_20d_pct: float | None = None
+    distance_from_200ema_pct: float | None = None
+
+
+class TimeframeAnalysis(BaseModel):
+    label: str
+    interval: str
+    trend: str
+    score: float = Field(ge=0, le=100)
+    last_close: float | None = None
+    ema_20: float | None = None
+    ema_50: float | None = None
+    rsi_14: float | None = None
 
 
 class PositionPlan(BaseModel):
@@ -60,6 +87,7 @@ class PositionPlan(BaseModel):
     risk_per_unit: float | None = None
     suggested_units: int | None = Field(default=None, ge=0)
     estimated_position_value: float | None = None
+    portfolio_allocation_pct: float | None = None
 
 
 class TradeSignal(BaseModel):
@@ -67,7 +95,10 @@ class TradeSignal(BaseModel):
     action: SignalAction
     lifecycle: SignalLifecycle = SignalLifecycle.waiting
     generated_at: datetime
+    price_timestamp: datetime
+    price_freshness: PriceFreshness = PriceFreshness.unknown
     timeframe: str
+    market_regime: MarketRegime
     current_price: float = Field(gt=0)
     entry_zone_low: float | None = Field(default=None, gt=0)
     entry_zone_high: float | None = Field(default=None, gt=0)
@@ -80,15 +111,27 @@ class TradeSignal(BaseModel):
     signal_strength: float = Field(ge=0, le=100)
     scores: ScoreBreakdown
     technicals: TechnicalSnapshot
+    timeframes: list[TimeframeAnalysis] = Field(default_factory=list)
     thesis: list[str] = Field(default_factory=list)
+    catalysts: list[str] = Field(default_factory=list)
     risks: list[str] = Field(default_factory=list)
     invalidation: str | None = None
     position_plan: PositionPlan | None = None
     data_source: str
+    methodology_version: str = "signals-v1.1"
+    execution_note: str = (
+        "Levels are model-generated reference levels, not guaranteed fills. Confirm the live market price before execution."
+    )
 
     @model_validator(mode="after")
-    def validate_entry_zone(self) -> "TradeSignal":
+    def validate_levels(self) -> "TradeSignal":
         if self.entry_zone_low is not None and self.entry_zone_high is not None:
             if self.entry_zone_low > self.entry_zone_high:
                 raise ValueError("entry_zone_low cannot exceed entry_zone_high")
+        if self.action in {SignalAction.long, SignalAction.strong_long} and self.ideal_entry and self.stop_loss:
+            if self.stop_loss >= self.ideal_entry:
+                raise ValueError("long stop_loss must be below ideal_entry")
+        if self.action in {SignalAction.short, SignalAction.strong_short} and self.ideal_entry and self.stop_loss:
+            if self.stop_loss <= self.ideal_entry:
+                raise ValueError("short stop_loss must be above ideal_entry")
         return self
