@@ -206,12 +206,12 @@ async def record_v1_signal(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@app.get("/api/v1/signals/history")
+@app.get("/api/v1/history/signals")
 async def get_v1_signal_history(symbol: str | None = None, limit: int = 100):
     return {"items": signal_history.list(symbol=symbol, limit=limit)}
 
 
-@app.get("/api/v1/signals/performance")
+@app.get("/api/v1/performance/signals")
 async def get_v1_signal_performance(symbol: str | None = None):
     return signal_history.performance(symbol=symbol)
 
