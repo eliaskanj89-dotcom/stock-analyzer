@@ -18,11 +18,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
 
 from config import get_stock_analysis_db_path
 
 from src.market_data import YFinanceProvider
 from src.signals.service import SignalService
+from src.signals.history import SignalHistoryStore
 
 
 from .schemas import (
@@ -81,11 +83,21 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Stock Analyzer API",
-    description="股票分析器 API",
-    version="1.0.0",
+    title="Signals Market Intelligence API",
+    description="Deterministic market signals, risk-defined trade plans, backtesting and analytics.",
+    version="1.1.0",
     lifespan=lifespan,
 )
+
+_allowed_origins = [x.strip() for x in os.environ.get("SIGNALS_CORS_ORIGINS", "http://localhost:5173").split(",") if x.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_allowed_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
+signal_history = SignalHistoryStore(DATA_DIR / "signals_history.jsonl")
 
 if STATIC_DIR.exists():
     app.mount("/assets", StaticFiles(directory=str(ASSETS_DIR)), name="assets")
@@ -172,6 +184,51 @@ async def get_v1_signal(
     except Exception as exc:
         logger.exception("Signal generation failed for %s", symbol)
         raise HTTPException(status_code=500, detail=f"Signal generation failed: {exc}") from exc
+
+
+@app.post("/api/v1/signals/{symbol}/record")
+async def record_v1_signal(
+    symbol: str,
+    timeframe: str = "swing",
+    portfolio_value: float | None = None,
+    max_risk_pct: float = 1.0,
+):
+    """Generate and permanently record a signal snapshot for transparent performance tracking."""
+    try:
+        signal = SignalService(YFinanceProvider()).generate(
+            symbol=symbol,
+            timeframe=timeframe,
+            portfolio_value=portfolio_value,
+            max_risk_pct=max_risk_pct,
+        )
+        return signal_history.append(signal)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/signals/history")
+async def get_v1_signal_history(symbol: str | None = None, limit: int = 100):
+    return {"items": signal_history.list(symbol=symbol, limit=limit)}
+
+
+@app.get("/api/v1/signals/performance")
+async def get_v1_signal_performance(symbol: str | None = None):
+    return signal_history.performance(symbol=symbol)
+
+
+@app.get("/api/v1/scanner")
+async def scan_v1(symbols: str = "AAPL,MSFT,NVDA,AMZN,META,GOOGL,TSLA", limit: int = 20):
+    """Small-universe V1 scanner. Scheduled/background scanning is the next scaling layer."""
+    service = SignalService(YFinanceProvider())
+    requested = [s.strip().upper() for s in symbols.split(",") if s.strip()][:50]
+    results = []
+    for symbol in requested:
+        try:
+            results.append(service.generate(symbol).model_dump(mode="json"))
+        except Exception as exc:
+            logger.warning("Scanner skipped %s: %s", symbol, exc)
+    results.sort(key=lambda item: item["signal_strength"], reverse=True)
+    return {"items": results[: max(1, min(limit, 50))], "count": min(len(results), limit)}
 
 
 # stats 全表聚合(700万行)耗时数秒, 结果仅随 ETL 变化, 缓存 10 分钟
