@@ -21,6 +21,10 @@ from fastapi.staticfiles import StaticFiles
 
 from config import get_stock_analysis_db_path
 
+from src.market_data import YFinanceProvider
+from src.signals.service import SignalService
+
+
 from .schemas import (
     AgentChatRequest,
     BacktestRequest,
@@ -144,6 +148,30 @@ async def index():
     if html_file.exists():
         return HTMLResponse(content=html_file.read_text(encoding="utf-8"))
     return HTMLResponse(content=get_default_html())
+
+
+@app.get("/api/v1/signals/{symbol}")
+async def get_v1_signal(
+    symbol: str,
+    timeframe: str = "swing",
+    portfolio_value: float | None = None,
+    max_risk_pct: float = 1.0,
+):
+    """Generate a detailed deterministic trade setup using the configured market-data provider."""
+    try:
+        service = SignalService(YFinanceProvider())
+        signal = service.generate(
+            symbol=symbol,
+            timeframe=timeframe,
+            portfolio_value=portfolio_value,
+            max_risk_pct=max_risk_pct,
+        )
+        return signal.model_dump(mode="json")
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Signal generation failed for %s", symbol)
+        raise HTTPException(status_code=500, detail=f"Signal generation failed: {exc}") from exc
 
 
 # stats 全表聚合(700万行)耗时数秒, 结果仅随 ETL 变化, 缓存 10 分钟
