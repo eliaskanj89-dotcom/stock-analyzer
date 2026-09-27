@@ -12,6 +12,8 @@ from src.signals.models import (
     TradeSignal,
 )
 from src.signals.service import SignalService
+from src.signals.history import SignalHistoryStore
+from src.signals.models import SetupType
 
 
 class FakeProvider(MarketDataProvider):
@@ -87,3 +89,35 @@ def test_non_executable_signal_has_no_fake_levels():
     assert levels["ideal_entry"] is None
     assert levels["stop_loss"] is None
     assert levels["take_profit_1"] is None
+
+
+def test_pivot_levels_find_nearest_structure():
+    service = SignalService(FakeProvider())
+    frame = FakeProvider().history("TEST")
+    support, resistance = service._pivot_levels(frame)
+    assert support < float(frame["close"].iloc[-1])
+    assert resistance > float(frame["close"].iloc[-1])
+
+
+def test_historical_evidence_is_backward_looking():
+    service = SignalService(FakeProvider())
+    frame = FakeProvider().history("TEST")
+    evidence = service._historical_evidence(frame, SignalAction.long, SetupType.trend_continuation)
+    assert evidence is not None
+    assert evidence.sample_size > 0
+    assert 0 <= evidence.hit_rate_pct <= 100
+
+
+def test_lifecycle_evaluator_uses_conservative_stop_first(tmp_path):
+    store = SignalHistoryStore(tmp_path / "history.jsonl")
+    record = {
+        "symbol":"TEST","action":"LONG","lifecycle":"TRIGGERED","generated_at":"2026-01-01T00:00:00+00:00",
+        "ideal_entry":100.0,"entry_zone_low":99.0,"entry_zone_high":101.0,"stop_loss":95.0,
+        "take_profit_1":105.0,"take_profit_2":110.0,"take_profit_3":115.0,"entry_triggered_at":"2026-01-01T00:00:00",
+        "tp1_hit_at":None,"tp2_hit_at":None,"tp3_hit_at":None,"stop_hit_at":None,"closed_at":None,
+        "exit_price":None,"realized_return_pct":None,"realized_r_multiple":None
+    }
+    bars = pd.DataFrame([{"open":100,"high":106,"low":94,"close":101,"volume":1000}])
+    store._advance(record,bars)
+    assert record["lifecycle"] == "STOPPED"
+    assert record["realized_r_multiple"] == -1.0
