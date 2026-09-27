@@ -211,6 +211,13 @@ async def get_v1_signal_history(symbol: str | None = None, limit: int = 100):
     return {"items": signal_history.list(symbol=symbol, limit=limit)}
 
 
+@app.post("/api/v1/history/evaluate")
+async def evaluate_v1_signal_history(symbol: str | None = None):
+    """Advance recorded signal lifecycles against post-publication OHLC data."""
+    result = signal_history.evaluate(YFinanceProvider(), symbol=symbol)
+    return {**result, "performance": signal_history.performance(symbol=symbol)}
+
+
 @app.get("/api/v1/performance/signals")
 async def get_v1_signal_performance(symbol: str | None = None):
     return signal_history.performance(symbol=symbol)
