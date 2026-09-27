@@ -7,11 +7,13 @@ import pandas as pd
 
 from src.market_data import MarketDataProvider
 from src.signals.models import (
+    HistoricalEvidence,
     MarketRegime,
     PositionPlan,
     PriceFreshness,
     ScoreBreakdown,
     SignalAction,
+    SetupType,
     TechnicalSnapshot,
     TimeframeAnalysis,
     TradeSignal,
@@ -42,7 +44,9 @@ class SignalService:
         timeframes = self._multi_timeframe(symbol, daily)
         scores = self._score(daily, indicators, regime, timeframes)
         action = self._action(scores.total, indicators, regime)
-        levels = self._levels(action, quote.price, indicators)
+        setup_type = self._setup_type(action, quote.price, indicators)
+        levels = self._levels(action, quote.price, indicators, setup_type)
+        evidence = self._historical_evidence(daily, action, setup_type)
 
         position_plan = self._position_plan(
             portfolio_value=portfolio_value,
@@ -58,6 +62,7 @@ class SignalService:
             price_timestamp=quote.timestamp,
             price_freshness=PriceFreshness.unknown,
             timeframe=timeframe,
+            setup_type=setup_type,
             market_regime=regime,
             current_price=round(quote.price, 4),
             entry_zone_low=self._r(levels["entry_zone_low"]),
@@ -77,6 +82,7 @@ class SignalService:
             risks=self._risks(indicators, action, regime),
             invalidation=levels["invalidation"],
             position_plan=position_plan,
+            historical_evidence=evidence,
             data_source=self.provider.name,
         )
 
@@ -143,7 +149,8 @@ class SignalService:
         atr = tr.ewm(alpha=1 / 14, adjust=False).mean()
         avg_vol = volume.rolling(20).mean()
         relative_volume = volume.iloc[-1] / avg_vol.iloc[-1] if avg_vol.iloc[-1] else np.nan
-        lookback = frame.tail(20)
+        lookback = frame.tail(60)
+        support, resistance = self._pivot_levels(frame)
         change_20d = (close.iloc[-1] / close.iloc[-21] - 1) * 100 if len(close) >= 21 else np.nan
         distance_200 = (close.iloc[-1] / ema200.iloc[-1] - 1) * 100 if ema200.iloc[-1] else np.nan
 
@@ -156,11 +163,101 @@ class SignalService:
             "ema_200": self._finite(ema200.iloc[-1]),
             "atr_14": self._finite(atr.iloc[-1]) or max(float(close.iloc[-1]) * 0.02, 0.01),
             "relative_volume": self._finite(relative_volume),
-            "support": self._finite(float(lookback["low"].min())),
-            "resistance": self._finite(float(lookback["high"].max())),
+            "support": self._finite(support),
+            "resistance": self._finite(resistance),
             "change_20d_pct": self._finite(change_20d),
             "distance_from_200ema_pct": self._finite(distance_200),
         }
+
+
+    @staticmethod
+    def _pivot_levels(frame: pd.DataFrame, window: int = 3) -> tuple[float, float]:
+        """Nearest confirmed swing support/resistance; falls back to recent range."""
+        tail = frame.tail(90).copy()
+        lows = tail["low"].astype(float)
+        highs = tail["high"].astype(float)
+        close = float(tail["close"].iloc[-1])
+        pivot_lows, pivot_highs = [], []
+        for idx in range(window, len(tail) - window):
+            lo = float(lows.iloc[idx])
+            hi = float(highs.iloc[idx])
+            if lo <= float(lows.iloc[idx-window:idx+window+1].min()):
+                pivot_lows.append(lo)
+            if hi >= float(highs.iloc[idx-window:idx+window+1].max()):
+                pivot_highs.append(hi)
+        below = [x for x in pivot_lows if x < close]
+        above = [x for x in pivot_highs if x > close]
+        support = max(below) if below else float(lows.tail(20).min())
+        resistance = min(above) if above else float(highs.tail(20).max())
+        return support, resistance
+
+    @staticmethod
+    def _setup_type(action: SignalAction, price: float, i: dict[str, float | None]) -> SetupType:
+        atr = float(i["atr_14"] or max(price * 0.02, 0.01))
+        support, resistance, ema20 = i["support"], i["resistance"], i["ema_20"]
+        if action in {SignalAction.long, SignalAction.strong_long}:
+            if resistance and price >= resistance - 0.35 * atr:
+                return SetupType.breakout
+            if (support and abs(price - support) <= 0.8 * atr) or (ema20 and abs(price - ema20) <= 0.65 * atr):
+                return SetupType.pullback
+            return SetupType.trend_continuation
+        if action in {SignalAction.short, SignalAction.strong_short}:
+            if support and price <= support + 0.35 * atr:
+                return SetupType.breakdown
+            if resistance and abs(price - resistance) <= 0.8 * atr:
+                return SetupType.pullback
+            return SetupType.trend_continuation
+        return SetupType.none
+
+    def _historical_evidence(self, frame: pd.DataFrame, action: SignalAction, setup: SetupType) -> HistoricalEvidence | None:
+        """Walk-forward analog study. No future bar is used to classify an observation."""
+        if action not in {SignalAction.long, SignalAction.strong_long, SignalAction.short, SignalAction.strong_short}:
+            return None
+        if len(frame) < 120:
+            return HistoricalEvidence(note="Not enough history for a meaningful walk-forward analog study.")
+        close = frame["close"].astype(float)
+        ema20 = close.ewm(span=20, adjust=False).mean()
+        ema50 = close.ewm(span=50, adjust=False).mean()
+        delta = close.diff()
+        gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
+        loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean().replace(0, np.nan)
+        rsi = 100 - (100/(1+gain/loss))
+        horizon = 10
+        returns, holds = [], []
+        long_side = action in {SignalAction.long, SignalAction.strong_long}
+        for idx in range(55, len(frame)-horizon):
+            trend_ok = ema20.iloc[idx] > ema50.iloc[idx] if long_side else ema20.iloc[idx] < ema50.iloc[idx]
+            momentum_ok = rsi.iloc[idx] >= 50 if long_side else rsi.iloc[idx] <= 50
+            if not (trend_ok and momentum_ok):
+                continue
+            entry = float(close.iloc[idx])
+            exit_price = float(close.iloc[idx+horizon])
+            ret = (exit_price/entry-1)*100
+            if not long_side:
+                ret *= -1
+            returns.append(ret)
+            holds.append(horizon)
+        if not returns:
+            return HistoricalEvidence(note="No comparable historical observations passed the walk-forward filters.")
+        arr = np.array(returns, dtype=float)
+        wins = arr[arr > 0]
+        losses = arr[arr <= 0]
+        equity = np.cumprod(1 + arr/100)
+        peak = np.maximum.accumulate(equity)
+        drawdowns = (equity/peak-1)*100
+        avg_loss = float(losses.mean()) if len(losses) else None
+        avg_win = float(wins.mean()) if len(wins) else None
+        avg_r = abs(avg_win/avg_loss) if avg_win is not None and avg_loss not in (None, 0) else None
+        return HistoricalEvidence(
+            sample_size=len(arr), wins=len(wins), losses=len(losses),
+            hit_rate_pct=round(len(wins)/len(arr)*100, 2),
+            avg_return_pct=round(float(arr.mean()), 2),
+            avg_win_pct=round(avg_win, 2) if avg_win is not None else None,
+            avg_loss_pct=round(avg_loss, 2) if avg_loss is not None else None,
+            avg_r_multiple=round(avg_r, 2) if avg_r is not None else None,
+            max_drawdown_pct=round(float(drawdowns.min()), 2),
+            median_holding_bars=float(np.median(holds)),
+        )
 
     @staticmethod
     def _regime(i: dict[str, float | None]) -> MarketRegime:
@@ -242,11 +339,11 @@ class SignalService:
             return SignalAction.neutral
         return SignalAction.no_trade
 
-    def _levels(self, action: SignalAction, price: float, i: dict[str, float | None]) -> dict[str, float | str | None]:
+    def _levels(self, action: SignalAction, price: float, i: dict[str, float | None], setup_type: SetupType = SetupType.none) -> dict[str, float | str | None]:
         atr = float(i["atr_14"] or price * 0.02)
         support, resistance = i["support"], i["resistance"]
         if action in {SignalAction.strong_long, SignalAction.long}:
-            anchor = min(price, float(i["ema_20"] or price))
+            anchor = float(i["resistance"]) if setup_type == SetupType.breakout and i["resistance"] else min(price, float(i["ema_20"] or price))
             low, high = max(0.01, anchor - 0.25 * atr), anchor + 0.25 * atr
             stop = min(float(support), anchor - 1.5 * atr) if support else anchor - 1.5 * atr
             risk = max(anchor - stop, 0.01)
@@ -254,7 +351,7 @@ class SignalService:
             tp2, tp3 = anchor + 2 * risk, anchor + 3 * risk
             return self._level_dict(low, high, anchor, stop, tp1, tp2, tp3, 2.0, f"Daily close below {stop:.2f}.")
         if action in {SignalAction.strong_short, SignalAction.short}:
-            anchor = max(price, float(i["ema_20"] or price))
+            anchor = float(i["support"]) if setup_type == SetupType.breakdown and i["support"] else max(price, float(i["ema_20"] or price))
             low, high = max(0.01, anchor - 0.25 * atr), anchor + 0.25 * atr
             stop = max(float(resistance), anchor + 1.5 * atr) if resistance else anchor + 1.5 * atr
             risk = max(stop - anchor, 0.01)
