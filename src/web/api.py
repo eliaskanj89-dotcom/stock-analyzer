@@ -1398,3 +1398,27 @@ def run_server(host: str = "127.0.0.1", port: int = 8000):
     logger.info(f"   地址: http://{host}:{port}")
     logger.info(f"   文档: http://{host}:{port}/docs")
     uvicorn.run(app, host=host, port=port, log_level="warning")
+
+
+@app.get("/api/v1/market/{symbol}/chart")
+async def get_v1_market_chart(symbol: str, period: str = "6mo", interval: str = "1d"):
+    """Normalized OHLCV series for the Signals chart surface."""
+    allowed_periods = {"1mo", "3mo", "6mo", "1y", "2y"}
+    allowed_intervals = {"1h", "1d", "1wk"}
+    if period not in allowed_periods or interval not in allowed_intervals:
+        raise HTTPException(status_code=400, detail="Unsupported chart period or interval")
+    try:
+        frame = YFinanceProvider().history(symbol.upper(), period=period, interval=interval)
+        items = []
+        for ts, row in frame.tail(500).iterrows():
+            items.append({
+                "time": ts.isoformat(),
+                "open": round(float(row["open"]), 4),
+                "high": round(float(row["high"]), 4),
+                "low": round(float(row["low"]), 4),
+                "close": round(float(row["close"]), 4),
+                "volume": round(float(row["volume"]), 2),
+            })
+        return {"symbol": symbol.upper(), "period": period, "interval": interval, "items": items}
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
