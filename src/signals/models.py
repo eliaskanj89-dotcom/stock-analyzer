@@ -35,6 +35,29 @@ class MarketRegime(str, Enum):
     strong_downtrend = "STRONG_DOWNTREND"
 
 
+class SetupType(str, Enum):
+    breakout = "BREAKOUT"
+    pullback = "PULLBACK"
+    trend_continuation = "TREND_CONTINUATION"
+    breakdown = "BREAKDOWN"
+    mean_reversion = "MEAN_REVERSION"
+    none = "NONE"
+
+
+class HistoricalEvidence(BaseModel):
+    sample_size: int = 0
+    wins: int = 0
+    losses: int = 0
+    hit_rate_pct: float | None = None
+    avg_return_pct: float | None = None
+    avg_win_pct: float | None = None
+    avg_loss_pct: float | None = None
+    avg_r_multiple: float | None = None
+    max_drawdown_pct: float | None = None
+    median_holding_bars: float | None = None
+    note: str = "Walk-forward historical analogs using only information available at each historical bar."
+
+
 class PriceFreshness(str, Enum):
     realtime = "REALTIME"
     delayed = "DELAYED"
@@ -98,6 +121,7 @@ class TradeSignal(BaseModel):
     price_timestamp: datetime
     price_freshness: PriceFreshness = PriceFreshness.unknown
     timeframe: str
+    setup_type: SetupType = SetupType.none
     market_regime: MarketRegime
     current_price: float = Field(gt=0)
     entry_zone_low: float | None = Field(default=None, gt=0)
@@ -117,8 +141,9 @@ class TradeSignal(BaseModel):
     risks: list[str] = Field(default_factory=list)
     invalidation: str | None = None
     position_plan: PositionPlan | None = None
+    historical_evidence: HistoricalEvidence | None = None
     data_source: str
-    methodology_version: str = "signals-v1.1"
+    methodology_version: str = "signals-v1.2"
     execution_note: str = (
         "Levels are model-generated reference levels, not guaranteed fills. Confirm the live market price before execution."
     )
